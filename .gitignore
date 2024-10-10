@@ -1,6 +1,6 @@
 # Ignore build directories
 /x64/
-/OpenGL_Starting_Point/x64/
+/OpenGL_MultiPass_Rendering/x64/
 build/
 bin/
 obj/
