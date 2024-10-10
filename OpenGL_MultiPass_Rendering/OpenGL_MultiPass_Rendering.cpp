@@ -136,10 +136,21 @@ void scrollCallback(GLFWwindow* window, double xoffset, double yoffset) {
 // Utility function to load textures using stb_image or similar
 GLuint loadTextureFromFile(const char* path, const std::string& directory);
 
+std::string getFilenameFromPath(const std::string& path) {
+    size_t pos = path.find_last_of("/\\");
+    if (pos != std::string::npos)
+        return path.substr(pos + 1);
+    else
+        return path;
+}
+
 struct Vertex {
     glm::vec3 Position;
     glm::vec3 Normal;
-    glm::vec2 TexCoords;
+    glm::vec2 TexCoords;         // For diffuse texture
+    glm::vec2 LightmapTexCoords; // For lightmap texture
+    glm::vec3 Tangent;
+    glm::vec3 Bitangent;
 };
 
 struct Mesh {
@@ -147,11 +158,10 @@ struct Mesh {
     std::vector<unsigned int> indices;
     mutable unsigned int VAO;  // Mark as mutable to allow modification in const functions
     GLuint diffuseTexture;  // Store diffuse texture ID
-    bool isGlowing;  // New member for glowing flag
 
     // Updated constructor
-    Mesh(std::vector<Vertex> vertices, std::vector<unsigned int> indices, GLuint diffuseTexture, bool isGlowing)
-        : vertices(vertices), indices(indices), diffuseTexture(diffuseTexture), isGlowing(isGlowing) {
+    Mesh(std::vector<Vertex> vertices, std::vector<unsigned int> indices, GLuint diffuseTexture)
+        : vertices(vertices), indices(indices), diffuseTexture(diffuseTexture) {
         setupMesh();
     }
 
@@ -176,34 +186,29 @@ struct Mesh {
         // Vertex Normals
         glEnableVertexAttribArray(1);
         glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, sizeof(Vertex), (void*)offsetof(Vertex, Normal));
-        // Vertex Texture Coords
+        // Vertex Texture Coords (Diffuse)
         glEnableVertexAttribArray(2);
         glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, sizeof(Vertex), (void*)offsetof(Vertex, TexCoords));
+        // Lightmap Texture Coords
+        glEnableVertexAttribArray(3);
+        glVertexAttribPointer(3, 2, GL_FLOAT, GL_FALSE, sizeof(Vertex), (void*)offsetof(Vertex, LightmapTexCoords));
+        // Tangents
+        glEnableVertexAttribArray(4);
+        glVertexAttribPointer(4, 3, GL_FLOAT, GL_FALSE, sizeof(Vertex), (void*)offsetof(Vertex, Tangent));
+        // Bitangents
+        glEnableVertexAttribArray(5);
+        glVertexAttribPointer(5, 3, GL_FLOAT, GL_FALSE, sizeof(Vertex), (void*)offsetof(Vertex, Bitangent));
 
         glBindVertexArray(0);
     }
 
-    void Draw(GLuint shaderProgram, bool glowPass) const {
+    void Draw(GLuint shaderProgram) const {
         // Bind diffuse texture
         GLint diffuseLoc = glGetUniformLocation(shaderProgram, "diffuseTexture");
         if (diffuseLoc != -1) {
             glActiveTexture(GL_TEXTURE0);
             glBindTexture(GL_TEXTURE_2D, diffuseTexture);
             glUniform1i(diffuseLoc, 0);
-        }
-
-        GLint isGlowingLoc = glGetUniformLocation(shaderProgram, "isGlowing");
-        if (glowPass) {
-            if (isGlowing) {
-                if (isGlowingLoc != -1) glUniform1i(isGlowingLoc, 1);
-            }
-            else {
-                // Skip non-glowing materials in the glow pass
-                return;
-            }
-        }
-        else {
-            if (isGlowingLoc != -1) glUniform1i(isGlowingLoc, isGlowing ? 1 : 0);
         }
 
         // Bind VAO and draw the mesh
@@ -231,6 +236,8 @@ std::vector<Mesh> loadModel(const std::string& path) {
         aiMesh* mesh = scene->mMeshes[i];
         std::vector<Vertex> vertices;
         std::vector<unsigned int> indices;
+        GLuint normalMapTexture = 0;
+        GLuint lightmapTexture = 0;
 
         // Process vertices and indices
         for (unsigned int j = 0; j < mesh->mNumVertices; j++) {
@@ -238,6 +245,7 @@ std::vector<Mesh> loadModel(const std::string& path) {
             vertex.Position = glm::vec3(mesh->mVertices[j].x, mesh->mVertices[j].y, mesh->mVertices[j].z);
             vertex.Normal = glm::vec3(mesh->mNormals[j].x, mesh->mNormals[j].y, mesh->mNormals[j].z);
 
+            // First UV channel for diffuse texture
             if (mesh->mTextureCoords[0]) {
                 vertex.TexCoords = glm::vec2(mesh->mTextureCoords[0][j].x, mesh->mTextureCoords[0][j].y);
             }
@@ -245,7 +253,65 @@ std::vector<Mesh> loadModel(const std::string& path) {
                 vertex.TexCoords = glm::vec2(0.0f, 0.0f);
             }
 
+            // Second UV channel for lightmap texture
+            if (mesh->mTextureCoords[1]) {
+                vertex.LightmapTexCoords = glm::vec2(mesh->mTextureCoords[1][j].x, mesh->mTextureCoords[1][j].y);
+            }
+            else {
+                // If the second UV channel doesn't exist, we can default to the first one or set to zero
+                vertex.LightmapTexCoords = glm::vec2(0.0f, 0.0f);
+            }
+
             vertices.push_back(vertex);
+        }
+
+        // Calculate tangents and bitangents
+        for (unsigned int j = 0; j < mesh->mNumVertices; j++) {
+            // Initialize tangents and bitangents to zero
+            vertices[j].Tangent = glm::vec3(0.0f);
+            vertices[j].Bitangent = glm::vec3(0.0f);
+        }
+
+        // Loop over faces to compute tangents and bitangents
+        for (unsigned int j = 0; j < mesh->mNumFaces; j++) {
+            aiFace face = mesh->mFaces[j];
+
+            // Get the indices of the triangle
+            unsigned int i0 = face.mIndices[0];
+            unsigned int i1 = face.mIndices[1];
+            unsigned int i2 = face.mIndices[2];
+
+            Vertex& v0 = vertices[i0];
+            Vertex& v1 = vertices[i1];
+            Vertex& v2 = vertices[i2];
+
+            // Compute the edges of the triangle
+            glm::vec3 edge1 = v1.Position - v0.Position;
+            glm::vec3 edge2 = v2.Position - v0.Position;
+
+            // Compute the delta UV coordinates
+            glm::vec2 deltaUV1 = v1.TexCoords - v0.TexCoords;
+            glm::vec2 deltaUV2 = v2.TexCoords - v0.TexCoords;
+
+            float f = 1.0f / (deltaUV1.x * deltaUV2.y - deltaUV2.x * deltaUV1.y);
+
+            glm::vec3 tangent = f * (deltaUV2.y * edge1 - deltaUV1.y * edge2);
+            glm::vec3 bitangent = f * (-deltaUV2.x * edge1 + deltaUV1.x * edge2);
+
+            // Accumulate the tangents and bitangents
+            v0.Tangent += tangent;
+            v1.Tangent += tangent;
+            v2.Tangent += tangent;
+
+            v0.Bitangent += bitangent;
+            v1.Bitangent += bitangent;
+            v2.Bitangent += bitangent;
+        }
+
+        // Normalize the tangents and bitangents
+        for (unsigned int j = 0; j < vertices.size(); j++) {
+            vertices[j].Tangent = glm::normalize(vertices[j].Tangent);
+            vertices[j].Bitangent = glm::normalize(vertices[j].Bitangent);
         }
 
         for (unsigned int j = 0; j < mesh->mNumFaces; j++) {
@@ -258,32 +324,16 @@ std::vector<Mesh> loadModel(const std::string& path) {
         // Load the material
         aiMaterial* material = scene->mMaterials[mesh->mMaterialIndex];
         GLuint diffuseTexture = 0;
-        bool isGlowing = false;  // New flag for glowing
 
         if (material->GetTextureCount(aiTextureType_DIFFUSE) > 0) {
             aiString str;
             material->GetTexture(aiTextureType_DIFFUSE, 0, &str);
-            std::string texturePath = FileSystemUtils::getAssetFilePath(std::string(str.C_Str()));
+            std::string textureFilename = getFilenameFromPath(str.C_Str());
+            std::string texturePath = FileSystemUtils::getAssetFilePath("textures/" + textureFilename);
             diffuseTexture = loadTextureFromFile(texturePath.c_str(), "");
         }
 
-        // Retrieve the emissive color 'Ke'
-        aiColor3D emissive(0.0f, 0.0f, 0.0f);
-        if (material->Get(AI_MATKEY_COLOR_EMISSIVE, emissive) == AI_SUCCESS) {
-            if (emissive.r > 0.0f || emissive.g > 0.0f || emissive.b > 0.0f) {
-                isGlowing = true;
-                std::cout << "Mesh " << i << " is glowing with emissive color: "
-                    << emissive.r << ", " << emissive.g << ", " << emissive.b << std::endl;
-            }
-            else {
-                std::cout << "Mesh " << i << " is not glowing." << std::endl;
-            }
-        }
-        else {
-            std::cout << "Mesh " << i << " does not have an emissive color property." << std::endl;
-        }
-
-        meshes.push_back(Mesh(vertices, indices, diffuseTexture, isGlowing));
+        meshes.push_back(Mesh(vertices, indices, diffuseTexture));
     }
 
     return meshes;
@@ -416,7 +466,7 @@ int main() {
     glCullFace(GL_BACK); // Cull back faces (default)
 
     // Load the model
-    std::vector<Mesh> meshes = loadModel(FileSystemUtils::getAssetFilePath("models/tutorial_map.obj"));
+    std::vector<Mesh> meshes = loadModel(FileSystemUtils::getAssetFilePath("models/tutorial_map.fbx"));
 
     // Build and compile the shader program
    // Vertex Shader
@@ -569,8 +619,10 @@ int main() {
         // Render all objects (both glowing and non-glowing)
         for (const auto& mesh : meshes) {
             glm::mat4 model = glm::mat4(1.0f);
+            model = glm::scale(model, glm::vec3(0.01f)); // Scale down by 1/100 if units are in centimeters
+            model = glm::rotate(model, glm::radians(-90.0f), glm::vec3(1.0f, 0.0f, 0.0f)); // Correct orientation
             glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "model"), 1, GL_FALSE, glm::value_ptr(model));
-            mesh.Draw(shaderProgram, false);  // Render all objects (non-glow and glow)
+            mesh.Draw(shaderProgram);
         }
 
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
