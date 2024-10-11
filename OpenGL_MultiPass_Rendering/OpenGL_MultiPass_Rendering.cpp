@@ -85,6 +85,11 @@ const char* fragmentShaderSource = R"(
         return pow(color, vec3(1.0 / 2.2)); // Approximate linear to sRGB conversion
     }
 
+    // Helper function to adjust contrast
+    vec3 adjustContrast(vec3 color, float contrast) {
+        return clamp((color - 0.5) * contrast + 0.5, 0.0, 1.0);
+    }
+
     void main() {
         // Sample diffuse and lightmap textures (assumed to be in sRGB space)
         vec4 diffuseColor = texture(diffuseTexture, TexCoords); 
@@ -92,14 +97,17 @@ const char* fragmentShaderSource = R"(
 
         // Convert both diffuse and lightmap colors from sRGB to linear space
         vec3 diffuseLinear = sRGBtoLinear(diffuseColor.rgb);
-        vec3 lightmapLinear = sRGBtoLinear(lightmapColor.rgb);
+    
+        // Increase lightmap contrast to emphasize shadows
+        vec3 lightmapLinear = adjustContrast(sRGBtoLinear(lightmapColor.rgb), 1.5); 
 
-        // Perform the lighting blend in linear space
+        // Use multiplicative blending to emphasize shadows
         vec3 combinedLinear = mix(diffuseLinear, diffuseLinear * lightmapLinear, blendFactor);
 
         // Convert the final color back to sRGB space for display
         vec3 finalColor = LinearTosRGB(combinedLinear);
 
+        // Debug mode switching
         if (debugMode == 1) {
             finalColor = diffuseColor.rgb; // Show diffuse texture only (still in sRGB)
         } else if (debugMode == 2) {
@@ -673,7 +681,7 @@ int main() {
         glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "projection"), 1, GL_FALSE, glm::value_ptr(projection));
 
         // Set the blendFactor to control the lightmap influence
-        glUniform1f(glGetUniformLocation(shaderProgram, "blendFactor"), 1.0f); // 100% blend
+        glUniform1f(glGetUniformLocation(shaderProgram, "blendFactor"), 1.0f);
 
         // Render all meshes
         for (const auto& mesh : meshes) {
