@@ -73,24 +73,41 @@ const char* fragmentShaderSource = R"(
     uniform sampler2D diffuseTexture;
     uniform sampler2D lightmapTexture;
     uniform int debugMode; // 0: Combined, 1: Diffuse, 2: Lightmap
+    uniform float blendFactor; // Control lightmap influence
+
+    // Helper function to convert from sRGB to linear color space
+    vec3 sRGBtoLinear(vec3 color) {
+        return pow(color, vec3(2.2)); // Approximate sRGB to linear conversion
+    }
+
+    // Helper function to convert from linear to sRGB color space
+    vec3 LinearTosRGB(vec3 color) {
+        return pow(color, vec3(1.0 / 2.2)); // Approximate linear to sRGB conversion
+    }
 
     void main() {
-        vec4 diffuseColor = texture(diffuseTexture, TexCoords);
-        vec4 lightmapColor = texture(lightmapTexture, LightmapTexCoords) * 1.5f;
-        vec4 finalColor;
+        // Sample diffuse and lightmap textures (assumed to be in sRGB space)
+        vec4 diffuseColor = texture(diffuseTexture, TexCoords); 
+        vec4 lightmapColor = texture(lightmapTexture, LightmapTexCoords);
 
-        if (debugMode == 0) {
-            // Display the combined lightmap pass
-            finalColor = diffuseColor * lightmapColor;
-        } else if (debugMode == 1) {
-            // Display the diffuse texture only
-            finalColor = diffuseColor;
+        // Convert both diffuse and lightmap colors from sRGB to linear space
+        vec3 diffuseLinear = sRGBtoLinear(diffuseColor.rgb);
+        vec3 lightmapLinear = sRGBtoLinear(lightmapColor.rgb);
+
+        // Perform the lighting blend in linear space
+        vec3 combinedLinear = mix(diffuseLinear, diffuseLinear * lightmapLinear, blendFactor);
+
+        // Convert the final color back to sRGB space for display
+        vec3 finalColor = LinearTosRGB(combinedLinear);
+
+        if (debugMode == 1) {
+            finalColor = diffuseColor.rgb; // Show diffuse texture only (still in sRGB)
         } else if (debugMode == 2) {
-            // Display the lightmap texture only
-            finalColor = lightmapColor;
+            finalColor = lightmapColor.rgb; // Show lightmap texture only (still in sRGB)
         }
 
-        FragColor = finalColor;
+        // Output the final color with the diffuse texture's alpha channel
+        FragColor = vec4(finalColor, diffuseColor.a); 
     }
 )";
 
@@ -654,6 +671,9 @@ int main() {
         // Pass view and projection matrices to the shader
         glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "view"), 1, GL_FALSE, glm::value_ptr(view));
         glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "projection"), 1, GL_FALSE, glm::value_ptr(projection));
+
+        // Set the blendFactor to control the lightmap influence
+        glUniform1f(glGetUniformLocation(shaderProgram, "blendFactor"), 1.0f); // 100% blend
 
         // Render all meshes
         for (const auto& mesh : meshes) {
