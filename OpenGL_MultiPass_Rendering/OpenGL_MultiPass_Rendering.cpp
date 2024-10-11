@@ -47,8 +47,10 @@ const char* vertexShaderSource = R"(
     layout (location = 0) in vec3 aPos;
     layout (location = 1) in vec3 aNormal;
     layout (location = 2) in vec2 aTexCoords;
+    layout (location = 3) in vec2 aLightmapTexCoords;
 
-    out vec2 TexCoords;  // Pass to fragment shader
+    out vec2 TexCoords;
+    out vec2 LightmapTexCoords;
 
     uniform mat4 model;
     uniform mat4 view;
@@ -56,6 +58,7 @@ const char* vertexShaderSource = R"(
 
     void main() {
         TexCoords = aTexCoords;
+        LightmapTexCoords = aLightmapTexCoords; // Pass lightmap UVs
         gl_Position = projection * view * model * vec4(aPos, 1.0);
     }
 )";
@@ -65,11 +68,29 @@ const char* fragmentShaderSource = R"(
     out vec4 FragColor;
 
     in vec2 TexCoords;
+    in vec2 LightmapTexCoords;
 
     uniform sampler2D diffuseTexture;
+    uniform sampler2D lightmapTexture;
+    uniform int debugMode; // 0: Combined, 1: Diffuse, 2: Lightmap
 
     void main() {
-        FragColor = texture(diffuseTexture, TexCoords);
+        vec4 diffuseColor = texture(diffuseTexture, TexCoords);
+        vec4 lightmapColor = texture(lightmapTexture, LightmapTexCoords) * 1.5f;
+        vec4 finalColor;
+
+        if (debugMode == 0) {
+            // Display the combined lightmap pass
+            finalColor = diffuseColor * lightmapColor;
+        } else if (debugMode == 1) {
+            // Display the diffuse texture only
+            finalColor = diffuseColor;
+        } else if (debugMode == 2) {
+            // Display the lightmap texture only
+            finalColor = lightmapColor;
+        }
+
+        FragColor = finalColor;
     }
 )";
 
@@ -135,6 +156,7 @@ void scrollCallback(GLFWwindow* window, double xoffset, double yoffset) {
 
 // Utility function to load textures using stb_image or similar
 GLuint loadTextureFromFile(const char* path, const std::string& directory);
+GLuint lightmapTexture;
 
 std::string getFilenameFromPath(const std::string& path) {
     size_t pos = path.find_last_of("/\\");
@@ -204,12 +226,14 @@ struct Mesh {
 
     void Draw(GLuint shaderProgram) const {
         // Bind diffuse texture
-        GLint diffuseLoc = glGetUniformLocation(shaderProgram, "diffuseTexture");
-        if (diffuseLoc != -1) {
-            glActiveTexture(GL_TEXTURE0);
-            glBindTexture(GL_TEXTURE_2D, diffuseTexture);
-            glUniform1i(diffuseLoc, 0);
-        }
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, diffuseTexture);
+        glUniform1i(glGetUniformLocation(shaderProgram, "diffuseTexture"), 0);
+
+        // Bind the shared lightmap texture
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, lightmapTexture); // Use the global lightmapTexture
+        glUniform1i(glGetUniformLocation(shaderProgram, "lightmapTexture"), 1);
 
         // Bind VAO and draw the mesh
         glBindVertexArray(VAO);
@@ -465,6 +489,10 @@ int main() {
 
     glCullFace(GL_BACK); // Cull back faces (default)
 
+    // Load the shared lightmap texture
+    std::string lightmapPath = FileSystemUtils::getAssetFilePath("textures/tutorialLightingMap.tga");
+    lightmapTexture = loadTextureFromFile(lightmapPath.c_str(), "");
+
     // Load the model
     std::vector<Mesh> meshes = loadModel(FileSystemUtils::getAssetFilePath("models/tutorial_map.fbx"));
 
@@ -555,12 +583,10 @@ int main() {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 
-    // Main Color Pass (Scene)
-    Framebuffer colorPass(GL_RGB8, GL_RGB, GL_UNSIGNED_BYTE, WIDTH, HEIGHT);
+    // Lightmap Pass
+    Framebuffer lightmapPass(GL_RGB8, GL_RGB, GL_UNSIGNED_BYTE, WIDTH, HEIGHT);
+    lightmapPass.attachDepthBuffer(depthMap);
 
-
-    // Attach shared depth buffer to each framebuffer
-    colorPass.attachDepthBuffer(depthMap);
 
     // Set up the quad VAO
     GLuint quadVAO, quadVBO;
@@ -599,14 +625,27 @@ int main() {
         if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS)
             glfwSetWindowShouldClose(window, true);
 
-        // ========== First Pass: Regular Forward Rendering ==========
-        // Render the scene to the color FBO (Main Scene)
-        glBindFramebuffer(GL_FRAMEBUFFER, colorPass.framebuffer);
+        // Handle key inputs to toggle between modes
+        if (glfwGetKey(window, GLFW_KEY_1) == GLFW_PRESS) {
+            debugMode = 0;  // Show combined lightmap pass
+        }
+        if (glfwGetKey(window, GLFW_KEY_2) == GLFW_PRESS) {
+            debugMode = 1;  // Show diffuse texture only
+        }
+        if (glfwGetKey(window, GLFW_KEY_3) == GLFW_PRESS) {
+            debugMode = 2;  // Show lightmap texture only
+        }
+
+        // ========== First Pass: Lightmap Rendering ==========
+        glBindFramebuffer(GL_FRAMEBUFFER, lightmapPass.framebuffer);
         glClearColor(0.3f, 0.3f, 0.4f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
-        // Use the regular shader program
+        // Use the shader program for lightmapping
         glUseProgram(shaderProgram);
+
+        // Set the 'debugMode' uniform
+        glUniform1i(glGetUniformLocation(shaderProgram, "debugMode"), debugMode);
 
         // Set up view and projection matrices
         glm::mat4 view = camera.getViewMatrix();
@@ -616,37 +655,27 @@ int main() {
         glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "view"), 1, GL_FALSE, glm::value_ptr(view));
         glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "projection"), 1, GL_FALSE, glm::value_ptr(projection));
 
-        // Render all objects (both glowing and non-glowing)
+        // Render all meshes
         for (const auto& mesh : meshes) {
             glm::mat4 model = glm::mat4(1.0f);
-            model = glm::scale(model, glm::vec3(0.01f)); // Scale down by 1/100 if units are in centimeters
-            model = glm::rotate(model, glm::radians(-90.0f), glm::vec3(1.0f, 0.0f, 0.0f)); // Correct orientation
+            model = glm::scale(model, glm::vec3(0.01f));
+            model = glm::rotate(model, glm::radians(-90.0f), glm::vec3(1.0f, 0.0f, 0.0f));
             glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "model"), 1, GL_FALSE, glm::value_ptr(model));
             mesh.Draw(shaderProgram);
         }
 
+        // Unbind the framebuffer to render to the screen
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
-        // Render quad with the color buffer texture
+        // Render quad with the lightmap pass texture
         glClear(GL_COLOR_BUFFER_BIT);
         glDisable(GL_DEPTH_TEST);
-
-        // Handle key inputs to toggle between modes
-        if (glfwGetKey(window, GLFW_KEY_1) == GLFW_PRESS && !keyPressed) {
-            debugMode = 0;  // Show color buffer (main scene)
-            keyPressed = true;
-        }
-
-        // Reset keyPressed state when the keys are released
-        if (glfwGetKey(window, GLFW_KEY_1) == GLFW_RELEASE) {
-            keyPressed = false;
-        }
 
         // Use the post-processing (quad) shader program
         glUseProgram(quadShaderProgram);
 
         glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, colorPass.colorTexture);
+        glBindTexture(GL_TEXTURE_2D, lightmapPass.colorTexture);
         glUniform1i(glGetUniformLocation(quadShaderProgram, "colorMap"), 0);
 
         // Render the quad (fullscreen post-processing pass)
