@@ -7,8 +7,9 @@
 #include <glm/gtc/type_ptr.hpp>
 #include <iostream>
 #include "Camera.h"
-#include "FileSystemUtils.h"
 #include <random>
+#include <map>
+#include "FileSystemUtils.h"
 
 // Asset Importer
 #include <assimp/Importer.hpp>
@@ -119,6 +120,109 @@ const char* fragmentShaderSource = R"(
     }
 )";
 
+// New Vertex Shader Source
+const char* newVertexShaderSource = R"(
+    #version 430 core
+    layout (location = 0) in vec3 aPos;
+    layout (location = 1) in vec3 aNormal;
+    layout (location = 2) in vec2 aTexCoords;
+    layout (location = 4) in vec3 aTangent;
+    layout (location = 5) in vec3 aBitangent;
+
+    out vec2 TexCoords;
+    out vec3 FragPos;
+    out vec3 T;
+    out vec3 B;
+    out vec3 N;
+
+    uniform mat4 model;
+    uniform mat4 view;
+    uniform mat4 projection;
+
+    void main() {
+        TexCoords = aTexCoords;
+        FragPos = vec3(model * vec4(aPos, 1.0));
+        mat3 normalMatrix = transpose(inverse(mat3(model)));
+        T = normalize(normalMatrix * aTangent);
+        B = normalize(normalMatrix * aBitangent);
+        N = normalize(normalMatrix * aNormal);
+        gl_Position = projection * view * vec4(FragPos, 1.0);
+    }
+)";
+
+const char* newFragmentShaderSource = R"(
+    #version 430 core
+    out vec4 FragColor;
+
+    in vec2 TexCoords;
+    in vec3 FragPos;
+    in vec3 T;
+    in vec3 B;
+    in vec3 N;
+
+    uniform sampler2D diffuseTexture;
+    uniform sampler2D normalMap;
+    uniform int debugMode;
+    uniform vec3 lightDir;
+    uniform vec3 viewPos;
+    uniform float shininess = 32.0f;
+    uniform vec3 specularColor = vec3(0.35f, 0.35f, 0.35f);
+
+    void main() {
+        // Obtain normal from normal map in range [0,1]
+        vec3 normal = texture(normalMap, TexCoords).rgb;
+        normal = normalize(normal * 2.0 - 1.0);
+
+        // Construct TBN matrix
+        mat3 TBN = mat3(T, B, N);
+        vec3 worldNormal = normalize(TBN * normal);
+
+        // Compute lighting direction
+        vec3 lightDirection = normalize(-lightDir);
+
+        // Compute per-pixel diffuse term using normal mapping
+        float diff = max(dot(worldNormal, lightDirection), 0.0);
+
+        // Sample the diffuse texture for the base color
+        vec3 baseColor = texture(diffuseTexture, TexCoords).rgb;
+
+        // Compute the diffuse component
+        vec3 diffuse = diff * baseColor;
+
+        // Blinn-Phong specular calculation
+        vec3 viewDir = normalize(viewPos - FragPos);
+        vec3 halfDir = normalize(viewDir + lightDirection);
+        float specAngle = max(dot(worldNormal, halfDir), 0.0);
+        float spec = pow(specAngle, shininess);
+
+        // Sample the alpha channel from the diffuse texture to get the specular mask
+        float specularMask = texture(diffuseTexture, TexCoords).a;
+
+        // Modulate the specular component with the specular mask
+        vec3 specular = spec * specularColor * specularMask;
+
+        // Combine diffuse and specular components
+        vec3 finalColor = diffuse + specular;
+
+        // Debug modes
+        if (debugMode == 1) {
+            finalColor = baseColor; // Base color only
+        } else if (debugMode == 2) {
+            finalColor = normal * 0.5 + 0.5; // Visualize normal map (tangent space)
+        } else if (debugMode == 3) {
+            finalColor = diffuse; // Diffuse component only
+        } else if (debugMode == 4) {
+            finalColor = specular; // Specular component only
+        } else if (debugMode == 5) {
+            finalColor = vec3(specularMask); // Visualize specular mask
+        } else if (debugMode == 6) {
+            finalColor = worldNormal * 0.5 + 0.5; // Visualize world-space normal
+        }
+
+        FragColor = vec4(finalColor, 1.0);
+    }
+)";
+
 const char* quadVertexShaderSource = R"(
     #version 430 core
     layout (location = 0) in vec2 aPos;
@@ -132,16 +236,35 @@ const char* quadVertexShaderSource = R"(
     }
 )";
 
-const char* quadFragmentShaderSource = R"(
+const char* combinedQuadFragmentShaderSource = R"(
     #version 430 core
     out vec4 FragColor;
     in vec2 TexCoords;
 
-    uniform sampler2D colorMap;
+    uniform sampler2D firstPassTexture;
+    uniform sampler2D secondPassTexture;
 
     void main() {
-        vec3 color = texture(colorMap, TexCoords).rgb;
-        FragColor = vec4(color, 1.0);
+        // Sample colors from both textures
+        vec3 color1 = texture(firstPassTexture, TexCoords).rgb;
+        vec3 color2 = texture(secondPassTexture, TexCoords).rgb;
+
+        // Convert to linear space for accurate blending
+        vec3 linearColor1 = pow(color1, vec3(2.2));
+        vec3 linearColor2 = pow(color2, vec3(2.2));
+
+        float diffuseFactor = 1.5;
+        float specularFactor = 1.0;
+
+        vec3 combinedLinearColor = linearColor1 * diffuseFactor + linearColor2 * specularFactor;
+
+        // Apply tone mapping or clamp the color if necessary
+        //combinedLinearColor = clamp(combinedLinearColor, 0.0, 1.0);
+
+        // Convert back to sRGB for display
+        vec3 finalColor = pow(combinedLinearColor, vec3(1.0 / 2.2));
+
+        FragColor = vec4(finalColor, 1.0);
     }
 )";
 
@@ -179,9 +302,37 @@ void scrollCallback(GLFWwindow* window, double xoffset, double yoffset) {
     camera.processMouseScroll(static_cast<float>(yoffset));
 }
 
+// Define this mapping globally or pass it to your loadModel function
+std::map<std::string, std::string> materialNormalMapPaths = {
+    {"example_tutorial_ground", "textures/metal flat generic bump.png"},
+    {"example_tutorial_metal", "textures/metal flat generic bump.png"},
+    {"example_tutorial_metal_floor", "textures/metal flat generic bump.png"},
+    {"example_tutorial_plate_floor", "textures/metal plate floor bump.png"},
+    {"example_tutorial_panels", "textures/metal flat generic bump.png"},
+    {"boulder_grey", "textures/metal flat generic bump.png"}
+};
+
 // Utility function to load textures using stb_image or similar
 GLuint loadTextureFromFile(const char* path, const std::string& directory);
 GLuint lightmapTexture;
+
+GLuint createFlatNormalMap() {
+    // Create a 1x1 texture with RGB value (0.5, 0.5, 1.0)
+    unsigned char flatNormalData[3] = { 128, 128, 255 }; // (0.5 * 255, 0.5 * 255, 1.0 * 255)
+
+    GLuint textureID;
+    glGenTextures(1, &textureID);
+    glBindTexture(GL_TEXTURE_2D, textureID);
+
+    // Generate the texture
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, 1, 1, 0, GL_RGB, GL_UNSIGNED_BYTE, flatNormalData);
+
+    // Set texture parameters
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+    return textureID;
+}
 
 std::string getFilenameFromPath(const std::string& path) {
     size_t pos = path.find_last_of("/\\");
@@ -205,10 +356,11 @@ struct Mesh {
     std::vector<unsigned int> indices;
     mutable unsigned int VAO;  // Mark as mutable to allow modification in const functions
     GLuint diffuseTexture;  // Store diffuse texture ID
+    GLuint normalMapTexture;
 
     // Updated constructor
-    Mesh(std::vector<Vertex> vertices, std::vector<unsigned int> indices, GLuint diffuseTexture)
-        : vertices(vertices), indices(indices), diffuseTexture(diffuseTexture) {
+    Mesh(std::vector<Vertex> vertices, std::vector<unsigned int> indices, GLuint diffuseTexture, GLuint normalMapTexture)
+        : vertices(vertices), indices(indices), diffuseTexture(diffuseTexture), normalMapTexture(normalMapTexture) {
         setupMesh();
     }
 
@@ -255,10 +407,23 @@ struct Mesh {
         glBindTexture(GL_TEXTURE_2D, diffuseTexture);
         glUniform1i(glGetUniformLocation(shaderProgram, "diffuseTexture"), 0);
 
-        // Bind the shared lightmap texture
+        // Bind normal map texture
         glActiveTexture(GL_TEXTURE1);
-        glBindTexture(GL_TEXTURE_2D, lightmapTexture); // Use the global lightmapTexture
-        glUniform1i(glGetUniformLocation(shaderProgram, "lightmapTexture"), 1);
+        glBindTexture(GL_TEXTURE_2D, normalMapTexture);
+        glUniform1i(glGetUniformLocation(shaderProgram, "normalMap"), 1);
+
+        // Bind VAO and draw the mesh
+        glBindVertexArray(VAO);
+        glDrawElements(GL_TRIANGLES, indices.size(), GL_UNSIGNED_INT, 0);
+        glBindVertexArray(0);
+    }
+
+    // Renders the meshes in the scene without diffuse textures for the 2nd pass
+    void DrawWithoutDiffuse(GLuint shaderProgram) const {
+        // Bind normal map texture
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, normalMapTexture);
+        glUniform1i(glGetUniformLocation(shaderProgram, "normalMap"), 1);
 
         // Bind VAO and draw the mesh
         glBindVertexArray(VAO);
@@ -279,12 +444,16 @@ std::vector<Mesh> loadModel(const std::string& path) {
         return {};
     }
 
+    // Create the default flat normal map texture once
+    static GLuint flatNormalMap = createFlatNormalMap();
+
     std::vector<Mesh> meshes;
 
     for (unsigned int i = 0; i < scene->mNumMeshes; i++) {
         aiMesh* mesh = scene->mMeshes[i];
         std::vector<Vertex> vertices;
         std::vector<unsigned int> indices;
+        GLuint diffuseTexture = 0;
         GLuint normalMapTexture = 0;
         GLuint lightmapTexture = 0;
 
@@ -311,58 +480,20 @@ std::vector<Mesh> loadModel(const std::string& path) {
                 vertex.LightmapTexCoords = glm::vec2(0.0f, 0.0f);
             }
 
+            // Get tangent and bitangent from Assimp
+            if (mesh->HasTangentsAndBitangents()) {
+                vertex.Tangent = glm::vec3(mesh->mTangents[j].x, mesh->mTangents[j].y, mesh->mTangents[j].z);
+                vertex.Bitangent = glm::vec3(mesh->mBitangents[j].x, mesh->mBitangents[j].y, mesh->mBitangents[j].z);
+            }
+            else {
+                vertex.Tangent = glm::vec3(0.0f);
+                vertex.Bitangent = glm::vec3(0.0f);
+            }
+
             vertices.push_back(vertex);
         }
 
-        // Calculate tangents and bitangents
-        for (unsigned int j = 0; j < mesh->mNumVertices; j++) {
-            // Initialize tangents and bitangents to zero
-            vertices[j].Tangent = glm::vec3(0.0f);
-            vertices[j].Bitangent = glm::vec3(0.0f);
-        }
-
-        // Loop over faces to compute tangents and bitangents
-        for (unsigned int j = 0; j < mesh->mNumFaces; j++) {
-            aiFace face = mesh->mFaces[j];
-
-            // Get the indices of the triangle
-            unsigned int i0 = face.mIndices[0];
-            unsigned int i1 = face.mIndices[1];
-            unsigned int i2 = face.mIndices[2];
-
-            Vertex& v0 = vertices[i0];
-            Vertex& v1 = vertices[i1];
-            Vertex& v2 = vertices[i2];
-
-            // Compute the edges of the triangle
-            glm::vec3 edge1 = v1.Position - v0.Position;
-            glm::vec3 edge2 = v2.Position - v0.Position;
-
-            // Compute the delta UV coordinates
-            glm::vec2 deltaUV1 = v1.TexCoords - v0.TexCoords;
-            glm::vec2 deltaUV2 = v2.TexCoords - v0.TexCoords;
-
-            float f = 1.0f / (deltaUV1.x * deltaUV2.y - deltaUV2.x * deltaUV1.y);
-
-            glm::vec3 tangent = f * (deltaUV2.y * edge1 - deltaUV1.y * edge2);
-            glm::vec3 bitangent = f * (-deltaUV2.x * edge1 + deltaUV1.x * edge2);
-
-            // Accumulate the tangents and bitangents
-            v0.Tangent += tangent;
-            v1.Tangent += tangent;
-            v2.Tangent += tangent;
-
-            v0.Bitangent += bitangent;
-            v1.Bitangent += bitangent;
-            v2.Bitangent += bitangent;
-        }
-
-        // Normalize the tangents and bitangents
-        for (unsigned int j = 0; j < vertices.size(); j++) {
-            vertices[j].Tangent = glm::normalize(vertices[j].Tangent);
-            vertices[j].Bitangent = glm::normalize(vertices[j].Bitangent);
-        }
-
+        // Collect indices
         for (unsigned int j = 0; j < mesh->mNumFaces; j++) {
             aiFace face = mesh->mFaces[j];
             for (unsigned int k = 0; k < face.mNumIndices; k++) {
@@ -372,8 +503,15 @@ std::vector<Mesh> loadModel(const std::string& path) {
 
         // Load the material
         aiMaterial* material = scene->mMaterials[mesh->mMaterialIndex];
-        GLuint diffuseTexture = 0;
 
+        aiString name;
+        material->Get(AI_MATKEY_NAME, name);
+        std::string matName(name.C_Str());
+
+        // Print the material name for debugging
+        std::cout << "Material Name: " << matName << std::endl;
+
+        // Load diffuse texture
         if (material->GetTextureCount(aiTextureType_DIFFUSE) > 0) {
             aiString str;
             material->GetTexture(aiTextureType_DIFFUSE, 0, &str);
@@ -382,7 +520,35 @@ std::vector<Mesh> loadModel(const std::string& path) {
             diffuseTexture = loadTextureFromFile(texturePath.c_str(), "");
         }
 
-        meshes.push_back(Mesh(vertices, indices, diffuseTexture));
+        // Check if the material has a normal map specified in the mapping
+        auto it = materialNormalMapPaths.find(matName);
+        if (it != materialNormalMapPaths.end()) {
+            // Use FileSystemUtils to get the full path
+            std::string normalMapPath = FileSystemUtils::getAssetFilePath(it->second);
+            normalMapTexture = loadTextureFromFile(normalMapPath.c_str(), "");
+
+            // Print the normal map path for debugging
+            std::cout << "Using Normal Map: " << normalMapPath << std::endl;
+        }
+        else if (material->GetTextureCount(aiTextureType_NORMALS) > 0) {
+            // Existing code to load normal map from the model file
+            aiString str;
+            material->GetTexture(aiTextureType_NORMALS, 0, &str);
+            std::string textureFilename = getFilenameFromPath(str.C_Str());
+            std::string texturePath = FileSystemUtils::getAssetFilePath("textures/" + textureFilename);
+            normalMapTexture = loadTextureFromFile(texturePath.c_str(), "");
+        }
+        else {
+            // Assign the default flat normal map
+            normalMapTexture = flatNormalMap;
+        }
+
+        // Error handling if normal map fails to load
+        if (normalMapTexture == 0) {
+            std::cerr << "Failed to load normal map for material: " << matName << std::endl;
+        }
+
+        meshes.push_back(Mesh(vertices, indices, diffuseTexture, normalMapTexture));
     }
 
     return meshes;
@@ -393,20 +559,17 @@ GLuint loadTextureFromFile(const char* path, const std::string&) {
     glGenTextures(1, &textureID);
 
     int width, height, nrComponents;
-    unsigned char* data = stbi_load(path, &width, &height, &nrComponents, 0);
+    // Force stb_image to load 4 components (RGBA)
+    unsigned char* data = stbi_load(path, &width, &height, &nrComponents, 4);
     if (data) {
-        GLenum format;
-        if (nrComponents == 1)
-            format = GL_RED;
-        else if (nrComponents == 3)
-            format = GL_RGB;
-        else if (nrComponents == 4)
-            format = GL_RGBA;
+        GLenum format = GL_RGBA;
 
         glBindTexture(GL_TEXTURE_2D, textureID);
-        glTexImage2D(GL_TEXTURE_2D, 0, format, width, height, 0, format, GL_UNSIGNED_BYTE, data);
+        // Use GL_RGBA for both internal format and format
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, format, GL_UNSIGNED_BYTE, data);
         glGenerateMipmap(GL_TEXTURE_2D);
 
+        // Set texture parameters
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
@@ -574,19 +737,8 @@ int main() {
         std::cerr << "ERROR::QUAD_VERTEX_SHADER::COMPILATION_FAILED\n" << infoLog << std::endl;
     }
 
-    GLuint quadFragmentShader = glCreateShader(GL_FRAGMENT_SHADER);
-    glShaderSource(quadFragmentShader, 1, &quadFragmentShaderSource, NULL);
-    glCompileShader(quadFragmentShader);
-
-    glGetShaderiv(quadFragmentShader, GL_COMPILE_STATUS, &success);
-    if (!success) {
-        glGetShaderInfoLog(quadFragmentShader, 512, NULL, infoLog);
-        std::cerr << "ERROR::QUAD_FRAGMENT_SHADER::COMPILATION_FAILED\n" << infoLog << std::endl;
-    }
-
     GLuint quadShaderProgram = glCreateProgram();
     glAttachShader(quadShaderProgram, quadVertexShader);
-    glAttachShader(quadShaderProgram, quadFragmentShader);
     glLinkProgram(quadShaderProgram);
 
     glGetProgramiv(quadShaderProgram, GL_LINK_STATUS, &success);
@@ -596,7 +748,67 @@ int main() {
     }
 
     glDeleteShader(quadVertexShader);
-    glDeleteShader(quadFragmentShader);
+
+    // New Vertex Shader
+    GLuint newVertexShader = glCreateShader(GL_VERTEX_SHADER);
+    glShaderSource(newVertexShader, 1, &newVertexShaderSource, NULL);
+    glCompileShader(newVertexShader);
+
+    // Check for shader compile errors
+    glGetShaderiv(newVertexShader, GL_COMPILE_STATUS, &success);
+    if (!success) {
+        glGetShaderInfoLog(newVertexShader, 512, NULL, infoLog);
+        std::cerr << "ERROR::NEW_VERTEX_SHADER::COMPILATION_FAILED\n" << infoLog << std::endl;
+    }
+
+    // New Fragment Shader
+    GLuint newFragmentShader = glCreateShader(GL_FRAGMENT_SHADER);
+    glShaderSource(newFragmentShader, 1, &newFragmentShaderSource, NULL);
+    glCompileShader(newFragmentShader);
+
+    // Check for shader compile errors
+    glGetShaderiv(newFragmentShader, GL_COMPILE_STATUS, &success);
+    if (!success) {
+        glGetShaderInfoLog(newFragmentShader, 512, NULL, infoLog);
+        std::cerr << "ERROR::NEW_FRAGMENT_SHADER::COMPILATION_FAILED\n" << infoLog << std::endl;
+    }
+
+    // Link shaders
+    GLuint newShaderProgram = glCreateProgram();
+    glAttachShader(newShaderProgram, newVertexShader);
+    glAttachShader(newShaderProgram, newFragmentShader);
+    glLinkProgram(newShaderProgram);
+
+    // Check for linking errors
+    glGetProgramiv(newShaderProgram, GL_LINK_STATUS, &success);
+    if (!success) {
+        glGetProgramInfoLog(newShaderProgram, 512, NULL, infoLog);
+        std::cerr << "ERROR::NEW_SHADER_PROGRAM::LINKING_FAILED\n" << infoLog << std::endl;
+    }
+
+    glDeleteShader(newVertexShader);
+    glDeleteShader(newFragmentShader);
+
+    // Combined Quad shaders
+    GLuint combinedQuadVertexShader = glCreateShader(GL_VERTEX_SHADER);
+    glShaderSource(combinedQuadVertexShader, 1, &quadVertexShaderSource, NULL);
+    glCompileShader(combinedQuadVertexShader);
+    // Check for compilation errors...
+
+    GLuint combinedQuadFragmentShader = glCreateShader(GL_FRAGMENT_SHADER);
+    glShaderSource(combinedQuadFragmentShader, 1, &combinedQuadFragmentShaderSource, NULL);
+    glCompileShader(combinedQuadFragmentShader);
+    // Check for compilation errors...
+
+    GLuint combinedQuadShaderProgram = glCreateProgram();
+    glAttachShader(combinedQuadShaderProgram, combinedQuadVertexShader);
+    glAttachShader(combinedQuadShaderProgram, combinedQuadFragmentShader);
+    glLinkProgram(combinedQuadShaderProgram);
+    // Check for linking errors...
+
+    // Delete shaders after linking
+    glDeleteShader(combinedQuadVertexShader);
+    glDeleteShader(combinedQuadFragmentShader);
 
     /* FBO setup */
 
@@ -612,6 +824,9 @@ int main() {
     Framebuffer lightmapPass(GL_RGB8, GL_RGB, GL_UNSIGNED_BYTE, WIDTH, HEIGHT);
     lightmapPass.attachDepthBuffer(depthMap);
 
+    // Normal-specular Pass
+    Framebuffer normalMapPass(GL_RGB8, GL_RGB, GL_UNSIGNED_BYTE, WIDTH, HEIGHT);
+    normalMapPass.attachDepthBuffer(depthMap);
 
     // Set up the quad VAO
     GLuint quadVAO, quadVBO;
@@ -638,6 +853,9 @@ int main() {
     int debugMode = 0;  // Initialize outside the render loop
     bool keyPressed = false;  // Track key press state
 
+    // Set light direction
+    glm::vec3 lightDir = glm::normalize(glm::vec3(0.5f, -1.0f, 0.3f));
+
     // Render loop
     while (!glfwWindowShouldClose(window)) {
         float currentFrame = static_cast<float>(glfwGetTime());
@@ -659,6 +877,15 @@ int main() {
         }
         if (glfwGetKey(window, GLFW_KEY_3) == GLFW_PRESS) {
             debugMode = 2;  // Show lightmap texture only
+        }
+        if (glfwGetKey(window, GLFW_KEY_4) == GLFW_PRESS) {
+            debugMode = 3;  // Show normal mapping and specular lighting pass
+        }
+        if (glfwGetKey(window, GLFW_KEY_5) == GLFW_PRESS) {
+            debugMode = 4;  // Show normal map only
+        }
+        if (glfwGetKey(window, GLFW_KEY_6) == GLFW_PRESS) {
+            debugMode = 5;  // Show specular component only
         }
 
         // ========== First Pass: Lightmap Rendering ==========
@@ -683,6 +910,11 @@ int main() {
         // Set the blendFactor to control the lightmap influence
         glUniform1f(glGetUniformLocation(shaderProgram, "blendFactor"), 1.0f);
 
+        // Bind lightmap texture
+        glActiveTexture(GL_TEXTURE2);
+        glBindTexture(GL_TEXTURE_2D, lightmapTexture);
+        glUniform1i(glGetUniformLocation(shaderProgram, "lightmapTexture"), 2);
+
         // Render all meshes
         for (const auto& mesh : meshes) {
             glm::mat4 model = glm::mat4(1.0f);
@@ -692,21 +924,69 @@ int main() {
             mesh.Draw(shaderProgram);
         }
 
-        // Unbind the framebuffer to render to the screen
+        // Unbind the framebuffer
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
-        // Render quad with the lightmap pass texture
+        // ========== Second Pass: Normal Mapping and Specular Lighting ==========
+        // Second Pass: Normal Mapping and Specular Lighting
+        glBindFramebuffer(GL_FRAMEBUFFER, normalMapPass.framebuffer);
+        glClearColor(0.3f, 0.3f, 0.4f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+        // Use the shader program for normal mapping
+        glUseProgram(newShaderProgram);
+
+        // Set the 'debugMode' uniform
+        glUniform1i(glGetUniformLocation(newShaderProgram, "debugMode"), debugMode);
+
+        // Pass view and projection matrices to the shader
+        glUniformMatrix4fv(glGetUniformLocation(newShaderProgram, "view"), 1, GL_FALSE, glm::value_ptr(view));
+        glUniformMatrix4fv(glGetUniformLocation(newShaderProgram, "projection"), 1, GL_FALSE, glm::value_ptr(projection));
+        glUniform3fv(glGetUniformLocation(newShaderProgram, "lightDir"), 1, glm::value_ptr(lightDir));
+        glUniform3fv(glGetUniformLocation(newShaderProgram, "viewPos"), 1, glm::value_ptr(camera.getPosition()));
+
+        // Render all meshes
+        for (const auto& mesh : meshes) {
+            glm::mat4 model = glm::mat4(1.0f);
+            model = glm::scale(model, glm::vec3(0.01f));
+            model = glm::rotate(model, glm::radians(-90.0f), glm::vec3(1.0f, 0.0f, 0.0f));
+            glUniformMatrix4fv(glGetUniformLocation(newShaderProgram, "model"), 1, GL_FALSE, glm::value_ptr(model));
+
+            // Bind diffuse texture (for specular mask)
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, mesh.diffuseTexture);
+            glUniform1i(glGetUniformLocation(newShaderProgram, "diffuseTexture"), 0);
+
+            // Bind normal map texture
+            glActiveTexture(GL_TEXTURE1);
+            glBindTexture(GL_TEXTURE_2D, mesh.normalMapTexture);
+            glUniform1i(glGetUniformLocation(newShaderProgram, "normalMap"), 1);
+
+            // Draw mesh
+            mesh.DrawWithoutDiffuse(newShaderProgram);
+        }
+
+        // Unbind the framebuffer
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+        // ========== Final Pass: Combine Textures ==========
         glClear(GL_COLOR_BUFFER_BIT);
         glDisable(GL_DEPTH_TEST);
 
-        // Use the post-processing (quad) shader program
-        glUseProgram(quadShaderProgram);
+        // Use the combined quad shader program
+        glUseProgram(combinedQuadShaderProgram);
 
+        // Bind the first pass texture
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, lightmapPass.colorTexture);
-        glUniform1i(glGetUniformLocation(quadShaderProgram, "colorMap"), 0);
+        glUniform1i(glGetUniformLocation(combinedQuadShaderProgram, "firstPassTexture"), 0);
 
-        // Render the quad (fullscreen post-processing pass)
+        // Bind the second pass texture
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, normalMapPass.colorTexture);
+        glUniform1i(glGetUniformLocation(combinedQuadShaderProgram, "secondPassTexture"), 1);
+
+        // Render the quad
         glBindVertexArray(quadVAO);
         glDrawArrays(GL_TRIANGLES, 0, 6);
 
@@ -721,6 +1001,7 @@ int main() {
     // Clean up
     glDeleteProgram(shaderProgram);
     glDeleteProgram(quadShaderProgram);
+    glDeleteProgram(newShaderProgram);
     glDeleteVertexArrays(1, &quadVAO);
     glDeleteBuffers(1, &quadVBO);
     glDeleteFramebuffers(1, &depthMap);
